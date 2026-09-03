@@ -28,6 +28,10 @@ services:
       - /home/sultan/radarrs/websharr:/config
       - /home/sultan/plex/data:/data
 
+    labels:
+      plusnet.nat.target: "${TARGET:-caddy}"
+      plusnet.nat.ports: "9797"
+
     networks:
       - default
 
