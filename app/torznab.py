@@ -75,7 +75,12 @@ _CZ_RE = re.compile(r"\b(?:cz|cesk\w*|česk\w*|czech)\b", re.IGNORECASE)
 # e.g. "...SLOVAK.1080p.WEB..."); a bare "CZ"/"SK" is too ambiguous (often
 # subs or region). Doesn't apply when the name marks subtitles instead.
 _LANG_WORD_RE = re.compile(r"\b(?:czech|slovak)\b", re.IGNORECASE)
-_SUBS_RE = re.compile(r"\b(?:titulky|tit|subs?|subtitles)\b", re.IGNORECASE)
+_SUBS_RE = re.compile(
+    r"\b(?:titulky|tit|subs?|subtitles)\b|\b(?:cz|sk|en)[ ._-]?(?:tit|subs?)\b",
+    re.IGNORECASE,
+)
+_SHORT_LANG_RE = re.compile(r"(?<![a-z0-9])(?:cz|sk|en)(?![a-z0-9])", re.IGNORECASE)
+_MULTI_RE = re.compile(r"\b(?:multi(?:lang(?:uage)?)?|dual)\b", re.IGNORECASE)
 
 
 def dub_language(name: str) -> str:
@@ -89,6 +94,24 @@ def dub_language(name: str) -> str:
     if _SK_RE.search(name) and not _CZ_RE.search(name):
         return "Slovak"
     return "Czech"
+
+
+def release_language(name: str, fallback: str = "") -> str | None:
+    """Language value for a Newznab item.
+
+    ``None`` deliberately means "do not emit the language attribute".  *arr
+    can then parse explicit multi-audio markers from the release title instead
+    of Websharr incorrectly overriding them with the title's TMDB original
+    language (for example ``[CZ SK EN]`` becoming English-only).
+    """
+    name = name or ""
+    short_languages = {m.group(0).lower() for m in _SHORT_LANG_RE.finditer(name)}
+    explicit_multi = _MULTI_RE.search(name) or (
+        len(short_languages) > 1 and not _SUBS_RE.search(name)
+    )
+    if explicit_multi:
+        return None
+    return dub_language(name) or fallback
 
 
 def _xml_response(element: ET.Element, status_code: int = 200) -> Response:
@@ -214,7 +237,57 @@ def _is_video(name: str) -> bool:
     return name.lower().endswith(VIDEO_EXTENSIONS)
 
 
+_NON_FEATURE_RE = re.compile(
+    r"\b(?:sample|teaser|featurette)\b"
+    r"|\bend[ ._-]+credits?\b"
+    r"|\bcredits?[ ._-]+scene\b"
+    r"|\bdeleted[ ._-]+scenes?\b"
+    r"|\bofficial[ ._-]+trailer\b",
+    re.IGNORECASE,
+)
+_TRAILER_AT_END_RE = re.compile(
+    r"\btrailer\b(?:[\s._-]*\(?\d{4}\)?)?\.(?:mkv|mp4|avi|m4v|mov|wmv|webm|mpg|mpeg)$",
+    re.IGNORECASE,
+)
+
+
+def is_non_feature(name: str) -> bool:
+    """True for obvious samples, trailers and other non-feature extras."""
+    return bool(_NON_FEATURE_RE.search(name or "") or _TRAILER_AT_END_RE.search(name or ""))
+
+
 _RES_RE = re.compile(r"\b(480|540|576|720|1080|2160|4320)p?\b", re.I)
+
+
+def standard_resolution(width: int | str | None, height: int | str | None) -> int:
+    """Map cropped/non-standard dimensions to a quality *arr understands.
+
+    Webshare reports the encoded frame height, so a 1920x802 scope movie is
+    still a 1080p release and a 3840x1608 movie is still 2160p.  Prefer width
+    because it survives letterbox cropping; fall back to height when needed.
+    """
+    try:
+        w = int(width or 0)
+    except (TypeError, ValueError):
+        w = 0
+    try:
+        h = int(height or 0)
+    except (TypeError, ValueError):
+        h = 0
+
+    if w >= 3000 or h >= 1500:
+        return 2160
+    if w >= 1600 or h >= 800:
+        return 1080
+    if w >= 1000 or h >= 650:
+        return 720
+    if w >= 700:
+        return 576 if h >= 550 else 480
+    if h >= 550:
+        return 576
+    if h >= 440:
+        return 480
+    return 0
 
 
 async def _resolutions(client, results: list[SearchResult]) -> dict[str, int]:
@@ -230,7 +303,7 @@ async def _resolutions(client, results: list[SearchResult]) -> dict[str, int]:
         async with sem:
             try:
                 info = await client.file_info(r.ident)
-                return r.ident, int(info.get("height") or 0)
+                return r.ident, standard_resolution(info.get("width"), info.get("height"))
             except (WebshareError, httpx.HTTPError):
                 return r.ident, 0
 
@@ -469,8 +542,8 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
         # policy grabs the original audio and skips the dub. A file named after
         # the Czech dub title ("Kačeří příběhy ...") is a Czech release even
         # when it carries no "dabing" marker.
-        item_lang = dub_language(r.name) or \
-            ("Czech" if czech_titles and matches_query(czech_titles, r.name) else language)
+        fallback_lang = "Czech" if czech_titles and matches_query(czech_titles, r.name) else language
+        item_lang = release_language(r.name, fallback_lang)
         # Emit attrs in both namespaces so the feed parses whether Sonarr/Radarr
         # treats it as Newznab (usenet — the correct choice) or Torznab.
         for ns in (NEWZNAB_NS, TORZNAB_NS):
@@ -540,7 +613,7 @@ async def torznab_api(request: Request):
             logger.error("Search '%s' failed: %s", query, exc)
             return _error(900, f"Webshare search failed: {exc}")
         for r in results:
-            if r.ident in seen or r.password or not _is_video(r.name):
+            if r.ident in seen or r.password or not _is_video(r.name) or is_non_feature(r.name):
                 continue
             if not matches_query(titles, r.name):
                 continue  # drop Webshare's loose non-matching fulltext hits
