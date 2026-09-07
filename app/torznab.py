@@ -69,8 +69,9 @@ def lang_name(code: str) -> str:
 # original audio with subtitles ("titulky"). Used to tag a dubbed release with
 # the dub language instead of the title's original language.
 _DUB_RE = re.compile(r"\bdab(?:ing|ovan\w*|\b)", re.IGNORECASE)
-_SK_RE = re.compile(r"\b(?:sk|slovensk\w*|slovak)\b", re.IGNORECASE)
+_SK_RE = re.compile(r"\b(?:sk|slovensk\w*|slovenc\w*|slovak)\b", re.IGNORECASE)
 _CZ_RE = re.compile(r"\b(?:cz|cesk\w*|česk\w*|czech)\b", re.IGNORECASE)
+_EN_RE = re.compile(r"\b(?:en|anglick\w*|english)\b", re.IGNORECASE)
 # A full "CZECH"/"SLOVAK" word names the audio language (scene convention,
 # e.g. "...SLOVAK.1080p.WEB..."); a bare "CZ"/"SK" is too ambiguous (often
 # subs or region). Doesn't apply when the name marks subtitles instead.
@@ -106,6 +107,12 @@ def release_language(name: str, fallback: str = "") -> str | None:
     """
     name = name or ""
     short_languages = {m.group(0).lower() for m in _SHORT_LANG_RE.finditer(name)}
+    if _CZ_RE.search(name):
+        short_languages.add("cz")
+    if _SK_RE.search(name):
+        short_languages.add("sk")
+    if _EN_RE.search(name):
+        short_languages.add("en")
     explicit_multi = _MULTI_RE.search(name) or (
         len(short_languages) > 1 and not _SUBS_RE.search(name)
     )

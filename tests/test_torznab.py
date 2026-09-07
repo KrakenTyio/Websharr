@@ -193,6 +193,7 @@ def test_dub_language_and_lang_name():
     # returning None prevents the TMDB fallback from forcing it to English.
     assert release_language("Toy Story 5 (2026) [CZ SK EN] [EN Atmos].mkv", "English") is None
     assert release_language("Toy Story 5 2026 CZ SK EN dab.mkv", "English") is None
+    assert release_language("Toy Story 5 2026 CZECH SLOVAK ENGLISH.mkv", "English") is None
     assert release_language("Toy Story 5 2026 MULTI 1080p.mkv", "English") is None
     assert release_language("Toy Story 5 2026 CZsub 1080p.mkv", "English") == "English"
     assert release_language("Toy Story 5 2026 SK dabing 1080p.mkv", "English") == "Slovak"
