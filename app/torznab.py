@@ -68,20 +68,39 @@ def lang_name(code: str) -> str:
 # Filename markers of a Czech/Slovak dub (audio replaced), as opposed to the
 # original audio with subtitles ("titulky"). Used to tag a dubbed release with
 # the dub language instead of the title's original language.
-_DUB_RE = re.compile(r"\bdab(?:ing|ovan\w*|\b)", re.IGNORECASE)
-_SK_RE = re.compile(r"\b(?:sk|slovensk\w*|slovenc\w*|slovak)\b", re.IGNORECASE)
-_CZ_RE = re.compile(r"\b(?:cz|cesk\w*|česk\w*|czech)\b", re.IGNORECASE)
-_EN_RE = re.compile(r"\b(?:en|anglick\w*|english)\b", re.IGNORECASE)
+_DUB_RE = re.compile(
+    r"\b(?:dab(?:b?ing|in|ig|ng|ovan\w*)?|dub(?:bed|bing)?)\b",
+    re.IGNORECASE,
+)
+_SK_RE = re.compile(r"\b(?:sk|svk|slk|slovensk\w*|slovenc\w*|slovak)\b", re.IGNORECASE)
+_CZ_RE = re.compile(
+    r"\b(?:cz|cze|ces|cesk\w*|česk\w*|cestin\w*|češtin\w*|czech)\b",
+    re.IGNORECASE,
+)
 # A full "CZECH"/"SLOVAK" word names the audio language (scene convention,
 # e.g. "...SLOVAK.1080p.WEB..."); a bare "CZ"/"SK" is too ambiguous (often
 # subs or region). Doesn't apply when the name marks subtitles instead.
 _LANG_WORD_RE = re.compile(r"\b(?:czech|slovak)\b", re.IGNORECASE)
 _SUBS_RE = re.compile(
-    r"\b(?:titulky|tit|subs?|subtitles)\b|\b(?:cz|sk|en)[ ._-]?(?:tit|subs?)\b",
+    r"(?<![a-z0-9])(?:titulky|tit(?:ulky)?|subs?|subtitles?|subbed)(?![a-z0-9])"
+    r"|(?<![a-z0-9])(?:cz|sk|en)[ ._-]?(?:st|tit|subs?)(?![a-z0-9])",
     re.IGNORECASE,
 )
-_SHORT_LANG_RE = re.compile(r"(?<![a-z0-9])(?:cz|sk|en)(?![a-z0-9])", re.IGNORECASE)
 _MULTI_RE = re.compile(r"\b(?:multi(?:lang(?:uage)?)?|dual)\b", re.IGNORECASE)
+
+_LANG_TOKEN_CODES = {
+    # Czech ISO/scene/localised variants.
+    "cz": "cz", "cze": "cz", "ces": "cz", "czech": "cz",
+    "cesky": "cz", "ceska": "cz", "ceske": "cz", "cestina": "cz",
+    # Slovak ISO/scene/localised variants.
+    "sk": "sk", "svk": "sk", "slk": "sk", "slovak": "sk",
+    "slovensky": "sk", "slovenska": "sk", "slovenske": "sk", "slovencina": "sk",
+    # English ISO/scene/localised variants.
+    "en": "en", "eng": "en", "english": "en",
+    "anglicky": "en", "anglicka": "en", "anglicke": "en", "anglictina": "en",
+}
+_LANG_OUTPUT = (("sk", "Slovak"), ("cz", "Czech"), ("en", "English"))
+_COMPACT_LANG_RE = re.compile(r"(?:cz|sk|en){2,}$", re.IGNORECASE)
 
 
 def dub_language(name: str) -> str:
@@ -97,27 +116,42 @@ def dub_language(name: str) -> str:
     return "Czech"
 
 
-def release_language(name: str, fallback: str = "") -> str | None:
-    """Language value for a Newznab item.
+def _language_codes(name: str) -> set[str]:
+    """Canonical audio-language codes found in common Webshare name variants."""
+    codes: set[str] = set()
+    for token in normalize_text(name).split():
+        code = _LANG_TOKEN_CODES.get(token)
+        if code:
+            codes.add(code)
+        elif _COMPACT_LANG_RE.fullmatch(token):
+            # Uploaders sometimes omit separators: CZSK, SKCZ or CZSKEN.
+            codes.update(part.lower() for part in re.findall(r"cz|sk|en", token, re.I))
+    return codes
 
-    ``None`` deliberately means "do not emit the language attribute".  *arr
-    can then parse explicit multi-audio markers from the release title instead
-    of Websharr incorrectly overriding them with the title's TMDB original
-    language (for example ``[CZ SK EN]`` becoming English-only).
+
+def release_language(name: str, fallback: str = "") -> str:
+    """Newznab language value, including comma-separated multi-audio names.
+
+    Both Radarr and Sonarr split the Newznab ``language`` attribute on commas.
+    Supplying canonical names avoids relying on their more restrictive title
+    parsers for Webshare variants such as ``CZE_SVK_ENG`` or ``CZSKEN``.
     """
     name = name or ""
-    short_languages = {m.group(0).lower() for m in _SHORT_LANG_RE.finditer(name)}
-    if _CZ_RE.search(name):
-        short_languages.add("cz")
-    if _SK_RE.search(name):
-        short_languages.add("sk")
-    if _EN_RE.search(name):
-        short_languages.add("en")
+    language_codes = _language_codes(name)
     explicit_multi = _MULTI_RE.search(name) or (
-        len(short_languages) > 1 and not _SUBS_RE.search(name)
+        len(language_codes) > 1 and (not _SUBS_RE.search(name) or _DUB_RE.search(name))
     )
     if explicit_multi:
-        return None
+        # Unknown MULTI/DUAL is intentionally left untagged rather than falsely
+        # reduced to the TMDB original language.
+        return ",".join(label for code, label in _LANG_OUTPUT if code in language_codes)
+    tokens = normalize_text(name).split()
+    has_explicit_name = any(
+        token in _LANG_TOKEN_CODES and token not in {"cz", "sk", "en"}
+        for token in tokens
+    )
+    if len(language_codes) == 1 and has_explicit_name and not _SUBS_RE.search(name):
+        return next(label for code, label in _LANG_OUTPUT if code in language_codes)
     return dub_language(name) or fallback
 
 
@@ -234,7 +268,12 @@ def release_title(query: str, season: str | None, ep: str | None, name: str) -> 
         prefix = f"{q} S{s:02d}"
     # Strip any SxxEyy/1x02 already in the filename so the release doesn't carry
     # two episode markers (confuses *arr's parser: "unable to determine episode").
-    stem = re.sub(r"\b(s\d{1,2}e\d{1,3}|\d{1,2}x\d{1,3})\b", "", stem, flags=re.I)
+    stem = re.sub(
+        r"\b(s\d{1,2}[ ._-]*e\d{1,3}|\d{1,2}x\d{1,3})\b",
+        "",
+        stem,
+        flags=re.I,
+    )
     stem = re.sub(r"\.{2,}", ".", stem)          # double dots left by the removal
     stem = re.sub(r"\s{2,}", " ", stem).strip(" .-")
     return _asciify(f"{prefix} - {stem}".strip(" -"))
@@ -264,6 +303,32 @@ def is_non_feature(name: str) -> bool:
 
 
 _RES_RE = re.compile(r"\b(480|540|576|720|1080|2160|4320)p?\b", re.I)
+
+
+def resolution_hint(name: str) -> int:
+    """Resolution inferred from common labels/typos when file_info is absent."""
+    tokens = normalize_text(name).split()
+    token_set = set(tokens)
+    if "8k" in token_set:
+        return 4320
+    if "4k" in token_set or "uhd" in token_set:
+        return 2160
+    if "fhd" in token_set or "fullhd" in token_set or \
+            any(a == "full" and b == "hd" for a, b in zip(tokens, tokens[1:])):
+        return 1080
+    for token in tokens:
+        fixed = token.replace("o", "0")  # 108Op / 1O80p / 216Op
+        match = re.fullmatch(r"(\d{3,4})p?", fixed)
+        if not match:
+            continue
+        height = int(match.group(1))
+        if 780 <= height <= 1100:
+            return 1080
+        if 650 <= height <= 760:
+            return 720
+        if height in (480, 540, 576, 2160, 4320):
+            return height
+    return 0
 
 
 def standard_resolution(width: int | str | None, height: int | str | None) -> int:
@@ -301,9 +366,12 @@ async def _resolutions(client, results: list[SearchResult]) -> dict[str, int]:
     """Fetch video height (via file_info) for results whose name has no
     resolution token, so we can label quality — many CZ files ship without
     one and Sonarr/Radarr reject them as 'Unknown' quality otherwise."""
-    need = [r for r in results if not _RES_RE.search(r.name)]
+    inferred = {r.ident: resolution_hint(r.name)
+                for r in results if not _RES_RE.search(r.name)}
+    inferred = {ident: height for ident, height in inferred.items() if height}
+    need = [r for r in results if not _RES_RE.search(r.name) and r.ident not in inferred]
     if not need:
-        return {}
+        return inferred
     sem = asyncio.Semaphore(6)
 
     async def one(r: SearchResult):
@@ -315,7 +383,8 @@ async def _resolutions(client, results: list[SearchResult]) -> dict[str, int]:
                 return r.ident, 0
 
     pairs = await asyncio.gather(*(one(r) for r in need))
-    return {ident: h for ident, h in pairs if h}
+    inferred.update({ident: h for ident, h in pairs if h})
+    return inferred
 
 
 _EP_TOKEN = re.compile(r"^(s\d{1,2}e\d{1,3}|s\d{1,2}|\d{1,2}x\d{1,3}|\d{1,4})$")
@@ -474,14 +543,60 @@ def file_marker(query, name: str) -> tuple[int | None, int | None]:
         series = _series_tokens(title)
         if series and ntoks[:len(series)] != series:
             continue  # this title isn't the one the file starts with
-        for tk in ntoks[len(series):]:
+        rest = ntoks[len(series):]
+        season_words = {"season", "serie", "seria", "rada"}
+        episode_words = {"episode", "epizoda", "ep", "diel", "dil", "cast"}
+        for index, tk in enumerate(rest):
             m = re.match(r"^s(\d{1,2})e(\d{1,3})$", tk) or re.match(r"^(\d{1,2})x(\d{1,3})$", tk)
             if m:
                 return int(m.group(1)), int(m.group(2))
+            # Common punctuation/space split: S01.E01, S01-E01, S01 E01.
+            sm = re.match(r"^s(\d{1,2})$", tk)
+            if sm and index + 1 < len(rest):
+                em = re.match(r"^e(?:p)?(\d{1,3})$", rest[index + 1])
+                if em:
+                    return int(sm.group(1)), int(em.group(1))
+            # Localised season names: "4. serie", "serie 4", "rada 4".
+            if tk.isdigit() and index + 1 < len(rest) and rest[index + 1] in season_words:
+                season_number = int(tk)
+                if index + 3 < len(rest):
+                    if rest[index + 2] in episode_words and rest[index + 3].isdigit():
+                        return season_number, int(rest[index + 3])
+                    if rest[index + 2].isdigit() and rest[index + 3] in episode_words:
+                        return season_number, int(rest[index + 2])
+                return season_number, None
+            if tk in season_words and index + 1 < len(rest) and rest[index + 1].isdigit():
+                season_number = int(rest[index + 1])
+                if index + 2 < len(rest):
+                    em = re.match(r"^e(?:p)?(\d{1,3})$", rest[index + 2])
+                    if em:
+                        return season_number, int(em.group(1))
+                if index + 3 < len(rest) and rest[index + 2] in episode_words \
+                        and rest[index + 3].isdigit():
+                    return season_number, int(rest[index + 3])
+                return season_number, None
+            em = re.match(r"^e(?:p)?(\d{1,3})$", tk)
+            if em:
+                return None, int(em.group(1))
+            if tk in episode_words and index + 1 < len(rest) and rest[index + 1].isdigit():
+                return None, int(rest[index + 1])
             if tk.isdigit() and len(tk) <= 2:  # bare episode number (skip years/1080)
                 return None, int(tk)
         break
     return None, None
+
+
+_MULTI_SEASON_PACK_RE = re.compile(
+    r"\bs(?:eason)?[ ._-]*\d{1,2}\.?\s*[-–—]\s*s?(?:eason)?[ ._-]*\d{1,2}\b"
+    r"|(?<![a-z0-9])\d{1,2}\.?\s*[-–—]\s*\d{1,2}\.?[ ._-]*"
+    r"(?:serie|series|seasons?|seria|rada)\b",
+    re.IGNORECASE,
+)
+
+
+def is_multi_season_pack(name: str) -> bool:
+    """True for packs such as ``S01-S08`` or ``1.-8. serie``."""
+    return bool(_MULTI_SEASON_PACK_RE.search(_asciify(name or "")))
 
 
 def file_episode(query, name: str) -> int | None:
@@ -622,6 +737,8 @@ async def torznab_api(request: Request):
         for r in results:
             if r.ident in seen or r.password or not _is_video(r.name) or is_non_feature(r.name):
                 continue
+            if want_season is not None and is_multi_season_pack(r.name):
+                continue  # Sonarr cannot safely map a multi-season pack to one requested season
             if not matches_query(titles, r.name):
                 continue  # drop Webshare's loose non-matching fulltext hits
             if year_conflict(r.name, year):

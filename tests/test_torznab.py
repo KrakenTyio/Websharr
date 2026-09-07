@@ -189,14 +189,23 @@ def test_dub_language_and_lang_name():
     assert lang_name("en") == "English"
     assert lang_name("cs") == "Czech"
     assert lang_name("") == "" and lang_name("xx") == ""
-    # An explicit multi-audio release must be parsed from its title by *arr;
-    # returning None prevents the TMDB fallback from forcing it to English.
-    assert release_language("Toy Story 5 (2026) [CZ SK EN] [EN Atmos].mkv", "English") is None
-    assert release_language("Toy Story 5 2026 CZ SK EN dab.mkv", "English") is None
-    assert release_language("Toy Story 5 2026 CZECH SLOVAK ENGLISH.mkv", "English") is None
-    assert release_language("Toy Story 5 2026 MULTI 1080p.mkv", "English") is None
+    # Explicit multi-audio releases use the comma-separated Newznab format
+    # understood by both Radarr and Sonarr, in the user's SK > CZ > EN order.
+    expected_multi = "Slovak,Czech,English"
+    assert release_language("Toy Story 5 (2026) [CZ SK EN] [EN Atmos].mkv",
+                            "English") == expected_multi
+    assert release_language("Toy Story 5 2026 CZ SK EN dab.mkv", "English") == expected_multi
+    assert release_language("Toy Story 5 2026 CZECH SLOVAK ENGLISH.mkv",
+                            "English") == expected_multi
+    assert release_language("Toy Story 5 2026 CZE_SVK_ENG.mkv", "English") == expected_multi
+    assert release_language("Toy Story 5 2026 CZSKEN.mkv", "English") == expected_multi
+    assert release_language("Toy Story 5 2026 MULTI 1080p.mkv", "English") == ""
     assert release_language("Toy Story 5 2026 CZsub 1080p.mkv", "English") == "English"
+    assert release_language("Toy Story 5 2026 SKST 1080p.mkv", "English") == "English"
     assert release_language("Toy Story 5 2026 SK dabing 1080p.mkv", "English") == "Slovak"
+    assert release_language("Toy Story 5 2026 SVK dubbing 1080p.mkv", "English") == "Slovak"
+    assert release_language("Toy Story 5 2026 CZE dabig 1080p.mkv", "English") == "Czech"
+    assert release_language("Toy Story 5 2026 slovencina 1080p.mkv", "English") == "Slovak"
 
 
 def test_feed_tags_language_original_and_dub(client, fake_webshare, monkeypatch):
@@ -231,8 +240,8 @@ def test_feed_tags_language_original_and_dub(client, fake_webshare, monkeypatch)
     assert "Czech" in langs     # dubbed file tagged with the dub language
 
 
-def test_feed_does_not_override_explicit_multi_audio(client, fake_webshare, monkeypatch):
-    """A CZ/SK/EN Webshare filename stays available to *arr's own parser."""
+def test_feed_emits_explicit_multi_audio(client, fake_webshare, monkeypatch):
+    """A CZ/SK/EN filename overrides the wrong English-only TMDB fallback."""
     from app import torznab
     from app.settings import settings
     monkeypatch.setattr(settings, "aliases", [])
@@ -261,7 +270,7 @@ def test_feed_does_not_override_explicit_multi_audio(client, fake_webshare, monk
 
     multi_title = next(title for title in by_title if "CZ SK EN" in title)
     original_title = next(title for title in by_title if "WEB-DL" in title)
-    assert by_title[multi_title] is None
+    assert by_title[multi_title] == "Slovak,Czech,English"
     assert by_title[original_title] == "English"
 
 
@@ -332,6 +341,32 @@ def test_file_marker_reads_season():
     assert file_marker("Zaklinac", "Zaklinac 1x07 dabing.avi") == (1, 7)
     assert file_marker("Skvrna", "Skvrna 05 - Bestie.mp4") == (None, 5)
     assert file_marker("Skvrna", "Skvrna - Bestie 1080p.mkv") == (None, None)
+    assert file_marker("Dexter", "Dexter S04.E01 CZ.mkv") == (4, 1)
+    assert file_marker("Dexter", "Dexter 4. serie (2009)(CZ EN).mkv") == (4, None)
+    assert file_marker("Dexter", "Dexter serie 4 epizoda 03.mkv") == (4, 3)
+    assert file_marker("Dexter", "Dexter 4. serie 03 diel.mkv") == (4, 3)
+
+
+def test_multi_season_pack_detection():
+    from app.torznab import is_multi_season_pack
+    assert is_multi_season_pack("Dexter S01-S08 1080p CZ.mkv")
+    assert is_multi_season_pack("Dexter 1.-8. serie (2006-2013)(CZ EN).mkv")
+    assert not is_multi_season_pack("Dexter 4. serie (2009)(CZ EN).mkv")
+    assert not is_multi_season_pack("Dexter S01E01-E08 1080p.mkv")
+
+
+def test_search_rejects_multi_season_pack_for_one_season(client, fake_webshare):
+    fake_webshare.fuzzy = True
+    fake_webshare.results = [
+        SearchResult("pack", "Dexter 1.-8. serie (2006-2013)(CZ EN).mkv", 100_000_000_000),
+        SearchResult("s4", "Dexter 4. serie (2009)(CZ EN).mkv", 20_000_000_000),
+        SearchResult("s3", "Dexter 3. serie (2008)(CZ EN).mkv", 19_000_000_000),
+    ]
+    resp = client.get("/torznab/api", params={
+        "t": "tvsearch", "apikey": "testkey", "q": "Dexter", "season": "4"})
+    titles = [item.findtext("title")
+              for item in ET.fromstring(resp.content).findall("channel/item")]
+    assert len(titles) == 1 and "4. serie" in titles[0]
 
 
 def test_search_drops_other_season_with_same_episode(client, fake_webshare, monkeypatch):
@@ -485,13 +520,18 @@ def test_search_labels_quality_from_fileinfo(client, fake_webshare):
 
 
 def test_standard_resolution_normalizes_cropped_video_dimensions():
-    from app.torznab import standard_resolution
+    from app.torznab import resolution_hint, standard_resolution
     assert standard_resolution(3840, 1608) == 2160
     assert standard_resolution(1920, 1040) == 1080
     assert standard_resolution(1920, 802) == 1080
     assert standard_resolution(1280, 536) == 720
     assert standard_resolution(720, 576) == 576
     assert standard_resolution(640, 360) == 0
+    assert resolution_hint("Movie.2026.1O80p.WEB-DL.mkv") == 1080
+    assert resolution_hint("Movie.2026.216Op.UHD.mkv") == 2160
+    assert resolution_hint("Movie.2026.800p.mkv") == 1080
+    assert resolution_hint("Movie.2026.FHD.mkv") == 1080
+    assert resolution_hint("Movie.2026.4K.mkv") == 2160
 
 
 def test_search_normalizes_nonstandard_fileinfo_height(client, fake_webshare):
