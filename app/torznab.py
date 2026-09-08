@@ -243,22 +243,31 @@ def _asciify(text: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
-def release_title(query: str, season: str | None, ep: str | None, name: str) -> str:
+def release_title(query: str, season: str | None, ep: str | None, name: str,
+                  *, identity_titles: list[str] | None = None) -> str:
     """Sonarr/Radarr-parseable release name.
 
-    Webshare filenames often lack SxxEyy (esp. CZ uploads like "Skvrna 01 -
-    Pohřeb"), which breaks *arr's import parser. For a tvsearch we prepend the
-    requested "<series> SxxEyy" so the folder/release name parses, then keep the
-    original stem for quality tokens and human recognition.
+    Only normalize a verified title/alias and episode marker. Never turn a
+    loose search hit into the requested show or hide conflicting numbering.
     """
-    stem = name.rsplit(".", 1)[0] if "." in name else name
+    stem = name.rsplit(".", 1)[0] if _is_video(name) else name
     if season is None:
         return _asciify(stem)
     try:
         s = int(season)
     except (TypeError, ValueError):
         return _asciify(stem)
+    fs, fe = file_marker(identity_titles or [query], name)
+    if not episode_matches(fs, fe, s, int(ep) if ep and str(ep).isdigit() else None):
+        return _asciify(stem)
+    if is_multi_season_pack(name) or re.search(
+        r"(?:s\d{1,2}[ ._-]*e\d{1,3}|\d{1,2}x\d{1,3})"
+        r"(?:[ ._-]*e\d{1,3}|\s*[-–—]\s*\d{1,3})", name, re.I
+    ):
+        return _asciify(stem)  # preserve ranges rather than invent one episode
     q = (query or "").strip()
+    if ep is None and fe is not None:
+        ep = str(fe)  # season search still returns individual episodes honestly
     if ep is not None:
         try:
             prefix = f"{q} S{s:02d}E{int(ep):02d}"
@@ -269,7 +278,7 @@ def release_title(query: str, season: str | None, ep: str | None, name: str) -> 
     # Strip any SxxEyy/1x02 already in the filename so the release doesn't carry
     # two episode markers (confuses *arr's parser: "unable to determine episode").
     stem = re.sub(
-        r"\b(s\d{1,2}[ ._-]*e\d{1,3}|\d{1,2}x\d{1,3})\b",
+        r"(?<![a-z0-9])(s\d{1,2}[ ._-]*e\d{1,3}|\d{1,2}x\d{1,3})(?![a-z0-9])",
         "",
         stem,
         flags=re.I,
@@ -421,13 +430,13 @@ def _title_key(text: str) -> str:
 
 def alias_titles(query: str, aliases: list[dict]) -> list[str]:
     """Extra Webshare/CZ titles for a query, from the user's alias map — an
-    alias applies when its `from` (a *arr title) appears in the query, ignoring
+    alias applies when its `from` matches the whole query, ignoring
     a leading article on either side."""
     qk = _title_key(query)
     out = []
     for a in aliases or []:
         fk, to = _title_key(a.get("from", "")), (a.get("to") or "").strip()
-        if fk and to and fk in qk:
+        if fk and to and fk == qk:
             out.append(to)
     return out
 
@@ -471,6 +480,12 @@ async def expand_titles(t: str, q: str, cat: str | None, *, tvdbid: str | None =
         res = None
         if tmdbid or imdbid or tvdbid:
             res = await tmdb_lookup_by_id(settings.tmdb_token, kind, tmdbid, imdbid, tvdbid)
+            if res:
+                # An authoritative ID must not keep a conflicting/short text
+                # query (e.g. q=Dexter for the Resurrection ID) as an alias.
+                titles = []
+                for resolved_title in (res[0], res[1], *res[3]):
+                    titles.extend(alias_titles(resolved_title, settings.aliases))
         if not res:
             res = await tmdb_lookup(settings.tmdb_token, kind, q)
         if res:
@@ -528,6 +543,43 @@ def matches_query(query, name: str) -> bool:
     return False
 
 
+def _tv_title_remainder(title: str, name: str) -> list[str] | None:
+    """Require an exact title boundary, not merely a shared franchise prefix.
+
+    Optional year then a numbering marker must immediately follow the title.
+    Unknown words between title and marker are ambiguous and fail closed.
+    Numbers in titles (The 100, 1923, 2 Socky) remain part of the identity.
+    """
+    title_tokens = _title_key(title).split()
+    name_tokens = _title_key(name).split()
+    if not title_tokens or name_tokens[:len(title_tokens)] != title_tokens:
+        return None
+    rest = name_tokens[len(title_tokens):]
+    if rest and re.fullmatch(r"(?:19|20)\d{2}", rest[0]):
+        rest = rest[1:]
+    if not rest or not re.fullmatch(
+        r"s\d{1,2}(?:e\d{1,3})?|\d{1,2}x\d{1,3}|e(?:p)?\d{1,3}"
+        r"|\d{1,2}|season|serie|seria|rada|episode|epizoda|ep|diel|dil|cast",
+        rest[0],
+    ):
+        return None
+    return rest
+
+
+def episode_matches(fs: int | None, fe: int | None,
+                    season: int | None, ep: int | None) -> bool:
+    """Unnumbered seasons may only use the established season-one convention."""
+    if fs is None and fe is None:
+        return False
+    if ep is not None and fe != ep:
+        return False
+    if season is not None:
+        if fs is not None:
+            return fs == season
+        return season == 1 and fe is not None
+    return True
+
+
 def file_marker(query, name: str) -> tuple[int | None, int | None]:
     """(season, episode) implied by the file name, read from the first marker
     after the (matched) show title: SxxEyy, 1x05, or a bare "05" (no season).
@@ -538,15 +590,13 @@ def file_marker(query, name: str) -> tuple[int | None, int | None]:
     episode-only match let season-2 files impersonate season 1, and the
     release-name rewrite then hid the real season from *arr entirely.
     """
-    ntoks = normalize_text(name).split()
-    for title in _as_titles(query):
-        series = _series_tokens(title)
-        if series and ntoks[:len(series)] != series:
-            continue  # this title isn't the one the file starts with
-        rest = ntoks[len(series):]
+    for title in sorted(_as_titles(query), key=lambda x: len(normalize_text(x)), reverse=True):
+        rest = _tv_title_remainder(title, name)
+        if rest is None:
+            continue
         season_words = {"season", "serie", "seria", "rada"}
         episode_words = {"episode", "epizoda", "ep", "diel", "dil", "cast"}
-        for index, tk in enumerate(rest):
+        for index, tk in enumerate(rest[:1]):
             m = re.match(r"^s(\d{1,2})e(\d{1,3})$", tk) or re.match(r"^(\d{1,2})x(\d{1,3})$", tk)
             if m:
                 return int(m.group(1)), int(m.group(2))
@@ -556,6 +606,8 @@ def file_marker(query, name: str) -> tuple[int | None, int | None]:
                 em = re.match(r"^e(?:p)?(\d{1,3})$", rest[index + 1])
                 if em:
                     return int(sm.group(1)), int(em.group(1))
+            if sm:
+                return int(sm.group(1)), None
             # Localised season names: "4. serie", "serie 4", "rada 4".
             if tk.isdigit() and index + 1 < len(rest) and rest[index + 1] in season_words:
                 season_number = int(tk)
@@ -618,7 +670,8 @@ def relevance(queries: list[str], name: str) -> float:
 def _render_feed(request: Request, results: list[SearchResult], category: str,
                  *, query: str | None = None, season: str | None = None,
                  ep: str | None = None, heights: dict[str, int] | None = None,
-                 language: str = "", czech_titles: list[str] | None = None) -> Response:
+                 language: str = "", czech_titles: list[str] | None = None,
+                 identity_titles: list[str] | None = None) -> Response:
     heights = heights or {}
     ET.register_namespace("torznab", TORZNAB_NS)
     ET.register_namespace("newznab", NEWZNAB_NS)
@@ -632,7 +685,7 @@ def _render_feed(request: Request, results: list[SearchResult], category: str,
 
     for r in results:
         item = ET.SubElement(channel, "item")
-        title = release_title(query, season, ep, r.name) if query is not None else \
+        title = release_title(query, season, ep, r.name, identity_titles=identity_titles) if query is not None else \
             (r.name.rsplit(".", 1)[0] if "." in r.name else r.name)
         # Label quality from the real video height when the name lacks one,
         # so *arr doesn't reject the release as "Unknown" quality.
@@ -741,14 +794,12 @@ async def torznab_api(request: Request):
                 continue  # Sonarr cannot safely map a multi-season pack to one requested season
             if not matches_query(titles, r.name):
                 continue  # drop Webshare's loose non-matching fulltext hits
-            if year_conflict(r.name, year):
-                continue  # same-named other title (DuckTales 1987 vs 2017)
+            if (t != "tvsearch" or want_season == 1) and year_conflict(r.name, year):
+                continue  # TV later-season filenames can carry that season's year
             if want_ep is not None or want_season is not None:
                 fs, fe = file_marker(titles, r.name)
-                if want_ep is not None and fe != want_ep:
-                    continue  # OR fulltext returns every episode; keep the asked one
-                if want_season is not None and fs is not None and fs != want_season:
-                    continue  # an S02E02 file is not the requested S01E02
+                if not episode_matches(fs, fe, want_season, want_ep):
+                    continue  # require both a verified series boundary and numbering
             seen.add(r.ident)
             merged.append(r)
 
@@ -758,7 +809,7 @@ async def torznab_api(request: Request):
     heights = await _resolutions(client, shown)
     return _render_feed(request, shown, category, heights=heights,
                         query=display, season=(season if t == "tvsearch" else None), ep=ep,
-                        language=language, czech_titles=czech_titles)
+                        language=language, czech_titles=czech_titles, identity_titles=titles)
 
 
 @router.get("/torznab/nzb/{ident}")

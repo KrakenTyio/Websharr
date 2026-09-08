@@ -156,11 +156,29 @@ Webshare's fulltext is loose (OR-based) and matches on any token, so raw results
 are noisy. For a TV query Websharr:
 
 - tries `S01E05`, `1x05` and a bare `05` (common for CZ uploads) variants;
-- keeps only files whose name **starts with the show title** (drops unrelated
-  files that merely contain a shared word or the episode number);
+- for a season/episode search, requires the complete show title or alias,
+  optionally a year, immediately followed by a numbering marker;
+- rejects shared franchise prefixes: `Dexter Resurrection S01E01` is not
+  `Dexter S01E01`; localized aliases and `S01.E01`, `1x01`, `1. série` and
+  `séria 1 epizóda 01` remain supported;
 - keeps only the **requested episode** (read from the file name), so a search
   for E05 doesn't return E01–E08;
 - ranks by relevance, and labels quality from the real video resolution.
+
+Only verified matches receive a normalized release name. A season search keeps
+each file's episode number; ambiguous names such as `Dexter FHD CZ` or
+`Dexter Resurrection 01` are omitted from a specific `Dexter S01E01` search.
+Bare episode numbers are accepted only for season 1. Later seasons require an
+explicit season marker, and their filename year need not equal the show's
+premiere year. Search aliases match the whole title (ignoring leading English
+articles), not substrings. A successfully resolved ID takes precedence over a
+conflicting text query. These rules apply to both the Newznab feed and UI.
+
+This intentionally trades some recall for safer automatic grabs. Files with
+extra words between the series title and numbering may need manual inspection.
+An incorrectly labelled file can still be misidentified: filenames are not
+proof of the actual video content. A plain title-only search can return broader
+results, but does not inject the requested season or episode into them.
 
 Even so, because matching is filename-based, the occasional odd result slips
 through — use Interactive Search / the UI when it does.
