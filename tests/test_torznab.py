@@ -29,8 +29,8 @@ def test_release_title_normalizes_for_tvsearch():
     # CZ filename without SxxEyy gets a parseable prefix, original kept for quality.
     assert release_title("Skvrna", "1", "1", "Skvrna 01 - Pohreb (Cajda).mp4") == \
         "Skvrna S01E01 - Skvrna 01 - Pohreb (Cajda)"
-    # Season-only search.
-    assert release_title("Skvrna", "2", None, "whatever.mkv") == "Skvrna S02 - whatever"
+    # Unverified files must never acquire the requested series/season.
+    assert release_title("Skvrna", "2", None, "whatever.mkv") == "whatever"
     # Non-tv search leaves the name (stem) untouched.
     assert release_title("Vlny 2024", None, None, "Vlny.2024.1080p.mkv") == "Vlny.2024.1080p"
 
@@ -310,7 +310,8 @@ def test_feed_tags_czech_for_file_named_after_czech_title(client, fake_webshare,
 
 def test_release_title_asciified():
     # diacritics transliterated so Prowlarr's download header stays latin-1 safe.
-    assert release_title("The Sleepers", "1", "2", "Bez vědomí.S01E02.mkv") == \
+    assert release_title("The Sleepers", "1", "2", "Bez vědomí.S01E02.mkv",
+                         identity_titles=["The Sleepers", "Bez vědomí"]) == \
         "The Sleepers S01E02 - Bez vedomi"
 
 

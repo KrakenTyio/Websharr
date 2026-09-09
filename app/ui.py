@@ -31,7 +31,9 @@ from .torznab import (
     VIDEO_EXTENSIONS,
     build_queries,
     expand_titles,
+    episode_matches,
     file_marker,
+    is_multi_season_pack,
     year_conflict,
     matches_query,
     parse_query,
@@ -472,14 +474,14 @@ async def ui_search(request: Request):
                 continue
             if not matches_query(titles, r.name):
                 continue  # drop Webshare's loose non-matching fulltext hits
-            if year_conflict(r.name, year):
+            if want_season is not None and is_multi_season_pack(r.name):
+                continue
+            if (t != "tvsearch" or want_season == 1) and year_conflict(r.name, year):
                 continue  # same-named other title (DuckTales 1987 vs 2017)
             if want_ep is not None or want_season is not None:
                 fs, fe = file_marker(titles, r.name)
-                if want_ep is not None and fe != want_ep:
-                    continue  # OR fulltext returns every episode; keep the asked one
-                if want_season is not None and fs is not None and fs != want_season:
-                    continue  # an S02E02 file is not the requested S01E02
+                if not episode_matches(fs, fe, want_season, want_ep):
+                    continue
             seen.add(r.ident)
             merged.append(r)
 
@@ -488,7 +490,8 @@ async def ui_search(request: Request):
     rel_ep = ep if t == "tvsearch" else None
     return {
         "results": [
-            _result_json(request, r, release_title(display, rel_season, rel_ep, r.name))
+            _result_json(request, r, release_title(
+                display, rel_season, rel_ep, r.name, identity_titles=titles))
             for r in merged[:limit]
         ],
         "queries": queries,
